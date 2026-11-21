@@ -2542,17 +2542,19 @@ async function readDirectoryIdentityAsync(directory) {
   return { directory: real, device: Number(stat.dev), ino: Number(stat.ino) };
 }
 
-async function validateDirectoryIdentityAsync(identity, file) {
+async function directoryIdentityMismatch(identity, file) {
   try {
     const stat = await fsp.lstat(identity.directory);
-    if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== identity.device
-      || await fsp.realpath(identity.directory) !== identity.directory
-      || await fsp.realpath(path.dirname(file)) !== identity.directory) throw new Error();
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return 'type';
+    if (stat.dev !== identity.device) return 'device';
+    const identityPath = await fsp.realpath(identity.directory);
+    const parentPath = await fsp.realpath(path.dirname(file));
+    if (path.relative(identityPath, parentPath) !== '') return 'path';
     if (Number.isSafeInteger(identity.ino) && identity.ino > 0
       && Number.isSafeInteger(stat.ino) && stat.ino > 0
-      && stat.ino !== identity.ino) throw new Error();
-    return true;
-  } catch (_) { return false; }
+      && stat.ino !== identity.ino) return 'inode';
+    return '';
+  } catch (_) { return 'unavailable'; }
 }
 
 async function nasDestinationCurrentAsync(destination, file) {
@@ -2585,37 +2587,50 @@ async function legacyFileMatchesAsync(task, file) {
 }
 
 async function completeTaskFileForList(task, conflicts) {
-  if (!task?.savePath || task.pathConflict || conflicts.get(task.savePath)?.has(task)) return null;
-  if (task.nasDestination && !await nasDestinationCurrentAsync(task.nasDestination, task.savePath)) return null;
-  if (!task.nasDestination && task.directoryIdentity
-    && !await validateDirectoryIdentityAsync(task.directoryIdentity, task.savePath)) return null;
+  const failed = reason => ({ error: reason });
+  if (!task?.savePath) return failed('missing-path');
+  if (task.pathConflict) return failed('path-conflict');
+  if (conflicts.get(task.savePath)?.has(task)) return failed('task-conflict');
+  if (task.nasDestination && !await nasDestinationCurrentAsync(task.nasDestination, task.savePath)) return failed('nas-identity');
+  if (!task.nasDestination && task.directoryIdentity) {
+    const mismatch = await directoryIdentityMismatch(task.directoryIdentity, task.savePath);
+    if (mismatch) return failed(`directory-${mismatch}`);
+  }
   try {
     const stat = await fsp.lstat(task.savePath);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 1024 * 100) return null;
+    if (!stat.isFile() || stat.isSymbolicLink()) return failed('not-file');
+    if (stat.size <= 1024 * 100) return failed('too-small');
     if (task.fileIdentity) {
       const current = await readFileIdentityAsync(task.savePath, { content: false });
-      if (!sameFileObject(task.fileIdentity, current)) return null;
+      if (!sameFileObject(task.fileIdentity, current)) return failed('file-identity');
       if (task.fileIdentity.contentHash
         && (current.mtimeNs !== task.fileIdentity.mtimeNs || current.ctimeNs !== task.fileIdentity.ctimeNs
           || current.birthtimeNs !== task.fileIdentity.birthtimeNs)) {
         const full = await readFileIdentityAsync(task.savePath);
-        if (!sameFileObject(task.fileIdentity, full)) return null;
+        if (!sameFileObject(task.fileIdentity, full)) return failed('content-identity');
       }
-    } else if (!await legacyFileMatchesAsync(task, task.savePath)) return null;
+    } else if (!await legacyFileMatchesAsync(task, task.savePath)) return failed('legacy-identity');
     return { size: stat.size, identity: task.fileIdentity?.contentHash ? task.fileIdentity : null };
-  } catch (_) { return null; }
+  } catch (_) { return failed('stat-error'); }
 }
 
 async function scanSeriesEpisodes(seriesId, seriesTitle, tasks, entry) {
   const conflicts = pathConflicts(downloadTasks);
-  const byIndex = new Map();
+  const byIndex = new Map(), failures = new Map();
   for (let offset = 0; offset < tasks.length; offset += 6) {
     const batch = tasks.slice(offset, offset + 6);
     const checked = await Promise.all(batch.map(task => completeTaskFileForList(task, conflicts)));
     batch.forEach((task, index) => {
       const complete = checked[index];
       const idx = Number(task.hongguoInfo?.vid_index) || 0;
-      if (!complete || !idx || !ownsEpisodeFiles(task.savePath, tasks)) return;
+      if (!complete || complete.error) {
+        if (idx && task.status === 'completed') failures.set(task.id, complete?.error || 'incomplete');
+        return;
+      }
+      if (!idx || !ownsEpisodeFiles(task.savePath, tasks)) {
+        if (idx && task.status === 'completed') failures.set(task.id, 'ownership');
+        return;
+      }
       const previous = byIndex.get(idx);
       if (!previous || (task.startTime || 0) > (previous.startTime || 0)) byIndex.set(idx, {
         vid_index: idx, startTime: task.startTime || 0, path: task.savePath,
@@ -2678,7 +2693,7 @@ async function scanSeriesEpisodes(seriesId, seriesTitle, tasks, entry) {
     });
   }
   return {
-    dir, dirIdentity, scanFailed, ordered: [...byIndex.values()].sort((a, b) => a.vid_index - b.vid_index),
+    dir, dirIdentity, scanFailed, failures, ordered: [...byIndex.values()].sort((a, b) => a.vid_index - b.vid_index),
   };
 }
 
@@ -2756,6 +2771,7 @@ async function seriesEpisodesData(seriesId, { withUrls = true } = {}) {
       actualQuality: task?.actualQuality || null,
       status, progress, fileSize, fileUrl, savePath,
       candidate,
+      localCheck: task?.status === 'completed' && !candidate ? scan.failures.get(task.id) || 'not-matched' : undefined,
     };
   }).sort((a, b) => a.vid_index - b.vid_index);
 
